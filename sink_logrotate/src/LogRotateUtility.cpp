@@ -22,6 +22,10 @@
 #include <regex>
 #include <sstream>
 #include <string>
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 namespace LogRotateUtility {
@@ -166,13 +170,15 @@ namespace LogRotateUtility {
    }
    /// return all files in the directory
    std::vector<std::string> getFilesInDirectory(const std::string& path) {
-      if (!fs::exists(path)) {
+      // runs on the sink thread, where an exception terminates the process
+      std::error_code ec;
+      if (!fs::exists(path, ec)) {
          return {};
       }
 
       std::vector<std::string> files;
-      for (const auto& entry : fs::directory_iterator(path)) {
-         files.push_back(entry.path().string());
+      for (fs::directory_iterator it(path, ec), end; !ec && it != end; it.increment(ec)) {
+         files.push_back(it->path().string());
       }
       return files;
    }
@@ -234,8 +240,23 @@ namespace LogRotateUtility {
       std::ofstream& stream(*(out.get()));
       bool success_with_open_file = openLogFile(file_with_full_path, stream);
       if (false == success_with_open_file) {
-         out.release();
+         out.reset();  // release() leaked the stream on every failed attempt
       }
       return out;
+   }
+
+   bool syncToDisk(const std::string& path) {
+#if defined(_WIN32)
+      (void)path;
+      return true;
+#else
+      const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+      if (fd < 0) {
+         return false;
+      }
+      const bool synced = (::fsync(fd) == 0);
+      ::close(fd);
+      return synced;
+#endif
    }
 }  // namespace LogRotateUtility

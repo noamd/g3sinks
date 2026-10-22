@@ -11,7 +11,9 @@
 
 #pragma once
 
+#include <cerrno>
 #include <cstdio>
+#include <sys/stat.h>
 #include <string>
 #include <memory>
 #include <fstream>
@@ -68,11 +70,21 @@ struct LogRotateHelper {
 
    void addLogFileHeader();
    bool rotateLog();
+   std::string archiveFileName();
+   void checkLogFile();
+   bool reopenLogFile(const std::string& note);
    void setLogSizeCounter();
    bool createCompressedFile(std::string file_name, std::string gzip_file_name);
    std::ofstream& filestream() {
       return *(outptr_.get());
    }
+
+   // how often the write path checks that log_file_with_path_ is still the file we write to
+   static constexpr std::chrono::seconds kLogFileCheckInterval{1};
+   // how long to wait before retrying a failed reopen or rotation
+   static constexpr std::chrono::seconds kRetryInterval{30};
+   static constexpr const char* kLogRemovedNote =
+      "g3log: log file was removed externally, its content since the last rotation was not archived\n";
 
    std::string log_file_with_path_;
    std::string log_directory_;
@@ -84,6 +96,11 @@ struct LogRotateHelper {
    std::streamoff cur_log_size_;
    size_t flush_policy_;
    size_t flush_policy_counter_;
+   dev_t log_file_dev_;  // identity of the open file, 0 when unknown
+   ino_t log_file_ino_;
+   steady_time_point next_log_file_check_;
+   steady_time_point next_rotation_attempt_;
+   std::chrono::system_clock::time_point last_archive_time_;
 };
 
 LogRotateHelper::LogRotateHelper(const std::string& log_prefix, const std::string& log_directory, size_t flush_policy)
@@ -92,8 +109,14 @@ LogRotateHelper::LogRotateHelper(const std::string& log_prefix, const std::strin
    , log_prefix_backup_(log_prefix)
    , outptr_(new std::ofstream)
    , steady_start_time_(std::chrono::steady_clock::now())
+   , cur_log_size_(0)
    , flush_policy_(flush_policy)
-   , flush_policy_counter_(flush_policy) {
+   , flush_policy_counter_(flush_policy)
+   , log_file_dev_(0)
+   , log_file_ino_(0)
+   , next_log_file_check_()
+   , next_rotation_attempt_()
+   , last_archive_time_() {
    log_prefix_backup_ = prefixSanityFix(log_prefix);
    max_log_size_ = 524288000;
    max_archive_log_count_ = 10;
@@ -101,8 +124,9 @@ LogRotateHelper::LogRotateHelper(const std::string& log_prefix, const std::strin
       std::cerr << "g3log: forced abort due to illegal log prefix [" << log_prefix << "]" << std::endl;
       abort();
    }
-   auto logfile = changeLogFile(log_directory, log_prefix_backup_);
-   assert((nullptr != outptr_) && "bad directory or file path, cannot open log file at startup");
+   // set before opening: if the open fails, checkLogFile keeps retrying this path
+   log_file_with_path_ = addLogSuffix(createPathToFile(sanityFixPath(log_directory), log_prefix_backup_));
+   changeLogFile(log_directory, log_prefix_backup_);
 }
 
 /**
@@ -142,8 +166,13 @@ LogRotateHelper::~LogRotateHelper() {
 }
 
 void LogRotateHelper::fileWrite(std::string message) {
+   checkLogFile();
    if (cur_log_size_ > max_log_size_) {
-      rotateLog();
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= next_rotation_attempt_ && !rotateLog()) {
+         // e.g. compression failed: don't redo it on every line
+         next_rotation_attempt_ = now + kRetryInterval;
+      }
    }
    fileWriteWithoutRotate(message);
 }
@@ -191,15 +220,17 @@ std::string LogRotateHelper::changeLogFile(const std::string& directory, const s
 
    namespace fs = std::filesystem;
    fs::path log_dir_path = fs::path(prospect_path);
-   if (!fs::exists(log_dir_path)) {
-      fs::create_directories(log_dir_path);
+   std::error_code ec;  // runs on the sink thread, where an exception terminates the process
+   if (!fs::exists(log_dir_path, ec)) {
+      fs::create_directories(log_dir_path, ec);  // a failure is reported below, when the file cannot be created
    }
 
    prospect_log = addLogSuffix(prospect_log);
 
    std::unique_ptr<std::ofstream> log_stream = createLogFile(prospect_log);
    if (nullptr == log_stream) {
-      fileWrite("Unable to change log file. Illegal filename or busy? Unsuccessful log name was:" + prospect_log);
+      // not fileWrite: it may rotate, and rotation calls back here
+      fileWriteWithoutRotate("Unable to change log file. Illegal filename or busy? Unsuccessful log name was:" + prospect_log + "\n");
       return ""; // no success
    }
    log_prefix_backup_ = file_name;
@@ -218,37 +249,44 @@ std::string LogRotateHelper::changeLogFile(const std::string& directory, const s
  * @return
  */
 bool LogRotateHelper::rotateLog() {
-   std::ofstream& is(filestream());
    namespace fs = std::filesystem;
-   fs::path log_file_path = fs::path(log_file_with_path_);
-   if (!fs::exists(log_file_path)) {
-      return false;
+   std::error_code ec;
+   const bool log_file_exists = fs::exists(log_file_with_path_, ec);
+   if (ec) {
+      return false; // cannot tell (e.g. no permission), try again later
+   }
+   if (!log_file_exists) {
+      return reopenLogFile(kLogRemovedNote);
    }
 
-
+   std::ofstream& is(filestream());
    if (is.is_open()) {
       is << std::flush;
-      std::ostringstream gz_file_name;
-      gz_file_name << log_file_with_path_ << ".";
-      auto now = std::chrono::system_clock::now();
-      gz_file_name << g3::localtime_formatted(now, "%Y-%m-%d-%H-%M-%S");
-      gz_file_name << ".gz";
-      if (!createCompressedFile(log_file_with_path_, gz_file_name.str())) {
-         fileWriteWithoutRotate("Failed to compress log!");
+      const std::string gz_file_name = archiveFileName();
+      if (!createCompressedFile(log_file_with_path_, gz_file_name)) {
+         fileWriteWithoutRotate("Failed to compress log to " + gz_file_name + ", will retry in "
+                                + std::to_string(kRetryInterval.count()) + " seconds\n");
          return false;
       }
       is.close();
+      std::string note = "Log rotated Archived file name: " + gz_file_name + "\n";
       std::error_code ec_file;
-      if (false == fs::remove(log_file_with_path_, ec_file)) {
-         fileWriteWithoutRotate("Failed to remove old log: " + log_file_with_path_ + ". Error: "
-                                + ec_file.message());
+      fs::remove(log_file_with_path_, ec_file);
+      if (ec_file) {
+         // Its content is archived, so empty it instead. Left as is, the same lines
+         // would be archived again on the next rotation.
+         const std::string failure = "Failed to remove old log: " + log_file_with_path_ + ". Error: " + ec_file.message();
+         fs::resize_file(log_file_with_path_, 0, ec_file);
+         if (ec_file) {
+            fs::remove(gz_file_name, ec_file);  // keep the lines in one place only, rotate again later
+            reopenLogFile(failure + ", will retry in " + std::to_string(kRetryInterval.count()) + " seconds\n");
+            return false;
+         }
+         note += failure + ", emptied it instead\n";
       }
       changeLogFile(log_directory_);
+      fileWriteWithoutRotate(note);
       std::ostringstream ss;
-      ss << "Log rotated Archived file name: " << gz_file_name.str().c_str() << "\n";
-      fileWriteWithoutRotate(ss.str());
-      ss.clear();
-      ss.str("");
       ss << log_prefix_backup_ << ".log";
       expireArchives(log_directory_, ss.str(), max_archive_log_count_);
       return true;
@@ -256,16 +294,100 @@ bool LogRotateHelper::rotateLog() {
    return false;
 }
 
+/**
+ * @return the name for the next archive. A rotation within the same second must not overwrite
+ * the previous archive, so take a later second rather than adding a suffix: expireArchives reads
+ * the time back from the name. Names only move forward, otherwise a second freed by expiring
+ * the oldest archive would be reused and the new archive expired first.
+ */
+std::string LogRotateHelper::archiveFileName() {
+   namespace fs = std::filesystem;
+   auto archive_time = std::max(std::chrono::system_clock::now(), last_archive_time_ + std::chrono::seconds(1));
+   std::string gz_file_name;
+   std::error_code ec;
+   while (true) {
+      gz_file_name = log_file_with_path_ + "." + g3::localtime_formatted(archive_time, "%Y-%m-%d-%H-%M-%S") + ".gz";
+      if (!fs::exists(gz_file_name, ec)) {
+         break;
+      }
+      archive_time += std::chrono::seconds(1);  // e.g. left by a previous run within the same second
+   }
+   last_archive_time_ = archive_time;
+   return gz_file_name;
+}
+
+/**
+ * Make sure we still write to the file at log_file_with_path_. Someone may have removed it
+ * ("rm"), or replaced it (an editor saving, "mv" plus a new file), or it failed to open earlier.
+ * Writing on would put the lines in a file nobody can reach. Also take the size counter from
+ * the real file, which truncation or other writers may have changed.
+ * Runs at most once per kLogFileCheckInterval.
+ */
+void LogRotateHelper::checkLogFile() {
+   const auto now = std::chrono::steady_clock::now();
+   if (now < next_log_file_check_) {
+      return;
+   }
+   next_log_file_check_ = now + kLogFileCheckInterval;
+
+   if (!filestream().is_open()) {
+      reopenLogFile("g3log: log file could not be opened earlier, lines logged meanwhile were lost\n");
+      return;
+   }
+
+   struct stat st {};
+   if (stat(log_file_with_path_.c_str(), &st) != 0) {
+      if (errno == ENOENT || errno == ENOTDIR) {
+         reopenLogFile(kLogRemovedNote);
+      }
+      return; // other errors: cannot tell, check again later
+   }
+   if (log_file_ino_ != 0 && (st.st_dev != log_file_dev_ || st.st_ino != log_file_ino_)) {
+      reopenLogFile("g3log: log file was replaced externally, continuing in the new file\n");
+      return;
+   }
+   if (filestream().fail()) {
+      // a write failed (e.g. disk full) and the stream ignores every later write until reopened
+      reopenLogFile("g3log: writing to the log file failed (disk full?), some lines were lost\n");
+      return;
+   }
+   cur_log_size_ = st.st_size;
+}
+
+/**
+ * Close the current log, which also releases its disk space if it was removed,
+ * and start writing to log_file_with_path_ again.
+ * @param note written to the new file to explain the reopen
+ * @return true if the log file was opened
+ */
+bool LogRotateHelper::reopenLogFile(const std::string& note) {
+   filestream().close();
+   if (changeLogFile(log_directory_).empty()) {
+      next_log_file_check_ = std::chrono::steady_clock::now() + kRetryInterval;
+      return false;
+   }
+   fileWriteWithoutRotate(note);
+   return true;
+}
+
 
 
 /**
-* Update the internal counter for the g3 log size
+* Update the internal counter for the g3 log size, and remember which file is open
+* so that checkLogFile notices when it is removed or replaced
 */
 void LogRotateHelper::setLogSizeCounter() {
-   std::ofstream& is(filestream());
-   is.seekp(0, std::ios::end);
-   cur_log_size_ = is.tellp();
-   is.seekp(0, std::ios::beg);
+   flush();  // the size on disk must include the header
+   struct stat st {};
+   if (stat(log_file_with_path_.c_str(), &st) == 0) {
+      cur_log_size_ = st.st_size;
+      log_file_dev_ = st.st_dev;
+      log_file_ino_ = st.st_ino;  // always 0 on Windows, which disables the replaced-file check
+   } else {
+      cur_log_size_ = 0;
+      log_file_dev_ = 0;
+      log_file_ino_ = 0;
+   }
    flush_policy_counter_ = flush_policy_;
 }
 
@@ -280,21 +402,36 @@ bool LogRotateHelper::createCompressedFile(std::string file_name, std::string gz
    const int buffer_size = 16184;
    char buffer[buffer_size];
    FILE* input = fopen(file_name.c_str(), "rb");
+   if (input == NULL) {
+      return false;
+   }
    gzFile output = gzopen(gzip_file_name.c_str(), "wb");
-
-   if (input == NULL || output == NULL) {
+   if (output == NULL) {
+      fclose(input);
       return false;
    }
 
+   bool write_status = true;
    size_t N;
    while ((N = fread(buffer, 1, buffer_size, input)) > 0) {
-      gzwrite(output, buffer, N);
+      if (gzwrite(output, buffer, static_cast<unsigned>(N)) == 0) {
+         write_status = false;  // e.g. disk full
+         break;
+      }
    }
+   write_status = write_status && (ferror(input) == 0);
    bool close_status = (gzclose(output) == Z_OK);
    close_status = (fclose(input) == 0)  && close_status;
 
-   return close_status;
-
+   // the original is deleted next, so the archive must survive a power cut first
+   if (!write_status || !close_status || !syncToDisk(gzip_file_name)) {
+      std::error_code ec;
+      std::filesystem::remove(gzip_file_name, ec);  // don't leave a truncated archive behind
+      return false;
+   }
+   // best effort: makes the archive's directory entry durable, not every file system supports it
+   syncToDisk(std::filesystem::path(gzip_file_name).parent_path().string());
+   return true;
 }
 
 std::string LogRotateHelper::logFileName() {

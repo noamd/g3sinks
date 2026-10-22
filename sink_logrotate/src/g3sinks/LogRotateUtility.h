@@ -72,4 +72,8 @@ namespace  LogRotateUtility {
    /// create the file
    std::unique_ptr<std::ofstream> createLogFile(const std::string& file_with_full_path);
 
+   /// force @param path (a file or a directory) to disk, so it survives a power cut
+   /// @return true on success, always true on Windows where it does nothing
+   bool syncToDisk(const std::string& path);
+
 } // anonymous
