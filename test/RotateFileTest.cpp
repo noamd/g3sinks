@@ -13,6 +13,8 @@
 #include <chrono>
 #include <cstring>
 #include <iostream>
+#include <sstream>
+#include <thread>
 #include "RotateTestHelper.h"
 #include "g3sinks/LogRotate.h"
 #include "g3sinks/LogRotateUtility.h"
@@ -296,6 +298,42 @@ TEST_F(RotateFileTest, rotateLog) {
    logrotate.save("test3");
    auto allFiles = LogRotateUtility::getAllLogFilesInDirectory(_directory, app_name);
    auto compressedFiles = LogRotateUtility::getCompressedLogFilesInDirectory(_directory, app_name);
-   EXPECT_EQ(allFiles.size(), size_t{2}) << "Failure: " << FlattenToString(allFiles);
-   EXPECT_EQ(compressedFiles.size(), size_t{1}) << "Failure: " << FlattenToString(compressedFiles);
+   // a rotation within the same second must not overwrite the previous archive
+   EXPECT_EQ(allFiles.size(), size_t{3}) << "Failure: " << FlattenToString(allFiles);
+   EXPECT_EQ(compressedFiles.size(), size_t{2}) << "Failure: " << FlattenToString(compressedFiles);
+}
+
+TEST_F(RotateFileTest, logFileRemovedExternally) {
+   LogRotate logrotate(_filename, _directory);
+   std::string logfilename = logrotate.logFileName();
+   logrotate.save("before delete\n");
+   ASSERT_TRUE(Exists(ReadContent(logfilename), "before delete"));
+
+   std::error_code ec;
+   if (!fs::remove(logfilename, ec)) {
+      GTEST_SKIP() << "cannot remove an open file on this platform: " << ec.message();
+   }
+   ASSERT_FALSE(fs::exists(logfilename));
+
+   // the log file is checked at most once per second
+   std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+   logrotate.save("after delete\n");
+
+   ASSERT_TRUE(fs::exists(logfilename));
+   auto content = ReadContent(logfilename);
+   EXPECT_FALSE(Exists(content, "before delete")) << "\n\tcontent:" << content;
+   EXPECT_TRUE(Exists(content, "after delete")) << "\n\tcontent:" << content;
+
+   // first line after the file header tells about the deletion
+   std::vector<std::string> lines;
+   std::istringstream stream(content);
+   for (std::string line; std::getline(stream, line);) {
+      if (!line.empty()) {
+         lines.push_back(line);
+      }
+   }
+   ASSERT_GE(lines.size(), size_t{3}) << "\n\tcontent:" << content;
+   EXPECT_TRUE(Exists(lines[0], "g3log: created log file at:")) << "\n\tcontent:" << content;
+   EXPECT_TRUE(Exists(lines[1], "g3log: log file was removed externally")) << "\n\tcontent:" << content;
+   EXPECT_EQ(lines[2], "after delete") << "\n\tcontent:" << content;
 }
